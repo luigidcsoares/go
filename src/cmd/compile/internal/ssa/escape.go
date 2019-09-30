@@ -3,7 +3,7 @@ package ssa
 import (
 	"cmd/compile/internal/types"
 	"cmd/internal/obj"
-	"fmt"
+	"log"
 )
 
 type (
@@ -53,23 +53,24 @@ func isHeapAlloc(v *Value) bool {
 	}
 }
 
-// escapeAnalysis walks through the values of a function f to determine whether
-// a value can safely be allocated on the stack or it escapes to the heap. This
-// complements the escape analysis applied to the AST.
-func escapeAnalysis(f *Func) {
-	if f.Name != "foo" {
-		return
-	}
-
-	// Initialize refMap and lookup for each reference to a value.
+// Keep track of each reference to a value.
+func findRefs(f *Func) map[*Value]*escapeNode {
 	refMap := map[*Value]*escapeNode{}
+
+	// Initialize refMap.
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
 			refMap[v] = &escapeNode{
-				value: v,
-				kind:  unchecked,
+				value:      v,
+				kind:       unchecked,
+				references: []*escapeNode{},
 			}
+		}
+	}
 
+	// Lookup for references.
+	for _, b := range f.Blocks {
+		for _, v := range b.Values {
 			for _, arg := range v.Args {
 				refMap[arg].references = append(
 					refMap[arg].references,
@@ -78,6 +79,23 @@ func escapeAnalysis(f *Func) {
 			}
 		}
 	}
+
+	return refMap
+}
+
+// escapeAnalysis walks through the values of a function f to determine whether
+// a value can safely be allocated on the stack or it escapes to the heap. This
+// complements the escape analysis applied to the AST.
+func escapeAnalysis(f *Func) {
+	if f.Name != "foo" {
+		return
+	}
+
+	// Init refMap and keep track of each reference to a value.
+	refMap := findRefs(f)
+
+	// Keep track of each heap allocation to rewrite later.
+	heapAllocs := []newobject{}
 
 	// Lookup for calls to runtime.newobject (i.e. heap allocations).
 	for _, b := range f.Blocks {
@@ -95,20 +113,35 @@ func escapeAnalysis(f *Func) {
 					call:   v,
 				},
 				ret: newobjectRet{
-					// Load is the first reference of a value corresponding to
-					// a runtime.newobject call since it is related to the
-					// caller getting the returned value. The returned value
-					// was placed in the stack and thus it must be loaded by using
-					// the offptr (the value before the load).
 					offptr: ref.Args[0],
 					load:   ref,
 				},
 			}
 
+			heapAllocs = append(heapAllocs, newobj)
 			root := refMap[newobj.ret.load]
 			escapes(root)
-			esc := !(root.kind == mustEscape)
-			fmt.Println("Is safe to be stack-allocated?", esc)
+			esc := root.kind == safe
+			log.Println("Is safe to be stack-allocated?", esc)
+		}
+	}
+
+	for _, h := range heapAllocs {
+		if refMap[h.ret.load].kind == safe {
+			_ = h.call.offptr.Args[0]
+
+			// Load will be converted to OffPtr
+			// h.ret.load.reset(OpOffPtr)
+			// h.ret.load.AddArg(sp)
+			// h.ret.load.AuxInt = h.ret.load.Type.Size()
+			// h.ret.load.Type = types.NewPtr(h.ret.load.Type)
+
+			// Each value related to heap alloc must be reseted.
+			// h.ret.offptr.resetArgs()
+			// h.call.call.resetArgs()
+			// h.call.store.resetArgs()
+			// h.call.offptr.resetArgs()
+			// h.call.addr.resetArgs()
 		}
 	}
 }
@@ -123,15 +156,13 @@ func escapes(node *escapeNode) {
 		// cannot postergate the decision and thus "analyzeLeaf" must return
 		// either "safe" or "mustEscape".
 		analyzeLeaf(node)
-		fmt.Println()
 
 	} else {
 		// Else we need to check each reference to value v. We're doing this by
-		// means of a DFS-like algorithm that may stop if we found a
+		// means of a DFS-like algorithm. Edges will be cutted if we found a
 		// "mustEscape" value.
 		for _, ref := range node.references {
 			analyzeNode(node, ref)
-			fmt.Println()
 
 			if node.kind == mayEscape {
 				escapes(ref)
@@ -178,13 +209,11 @@ func needAnalysis(node *escapeNode) (need bool) {
 // and thus we must return either "safe" or "mustEscape" (there's no place for
 // "mayEscape" in this function).
 func analyzeLeaf(node *escapeNode) {
-	fmt.Println("ANALYZE LEAF")
-	fmt.Println(node.value.LongString())
-
 	switch node.value.Op {
 	case OpStore:
 		gcnode, ok := node.value.Args[0].Aux.(GCNode)
 		if !(ok && gcnode.StorageClass() == ClassParamOut) {
+			node.kind = safe
 			return
 		}
 
@@ -203,13 +232,8 @@ func analyzeLeaf(node *escapeNode) {
 // Check if there's any chance to a value escapes from the function considering
 // a reference to v.
 func analyzeNode(node, ref *escapeNode) {
-	fmt.Println("ANALYZE NODE")
-	fmt.Println(node.value.LongString())
-	fmt.Println(ref.value.LongString())
-
 	switch ref.value.Op {
 	case OpStore:
-		fmt.Println("STORE")
 
 		// We only care for write operations, so to v escapes it first needs to
 		// be being written to another value (i.e. appears as Args[1]).
@@ -218,7 +242,6 @@ func analyzeNode(node, ref *escapeNode) {
 			return
 		}
 
-		fmt.Println(ref.value.Args[0].LongString())
 		gcnode, ok := ref.value.Args[0].Aux.(GCNode)
 		if !(ok && gcnode.StorageClass() == ClassParamOut) {
 			node.kind = mayEscape
@@ -236,7 +259,6 @@ func analyzeNode(node, ref *escapeNode) {
 		}
 
 	case OpCopy:
-		fmt.Println("COPY")
 		node.kind = mayEscape
 
 	case OpLoad:
