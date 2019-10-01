@@ -13,7 +13,7 @@ type (
 		addr,
 		offptr,
 		store,
-		call *Value
+		staticcall *Value
 	}
 
 	// Get the new address allocated by the runtime call.
@@ -30,18 +30,85 @@ type (
 	escapeNode struct {
 		value      *Value
 		references []*escapeNode
-		kind       kindEscape
+		state      nodeState
 	}
 
-	kindEscape = uint8
+	nodeState = uint8
 )
 
 const (
-	unchecked kindEscape = iota
+	unchecked nodeState = iota
 	safe
 	mayEscape
 	mustEscape
 )
+
+// escapeAnalysis walks through the values of a function f to determine whether
+// a value can safely be allocated on the stack or it escapes to the heap. This
+// complements the escape analysis applied to the AST.
+func escapeAnalysis(f *Func) {
+	if f.Name != "foo" {
+		return
+	}
+
+	// Init refMap and keep track of each reference to a value.
+	refMap := findRefs(f)
+
+	// Keep track of each heap allocation to rewrite later.
+	newobjList := []newobject{}
+
+	// Lookup for calls to runtime.newobject (i.e. heap allocations).
+	for _, b := range f.Blocks {
+		for _, v := range b.Values {
+			if !isHeapAlloc(v) {
+				continue
+			}
+
+			ref := refMap[v].references[0].value
+			newobj := newobject{
+				call: newobjectCall{
+					addr:       v.Args[0].Args[1],
+					offptr:     v.Args[0].Args[0],
+					store:      v.Args[0],
+					staticcall: v,
+				},
+				ret: newobjectRet{
+					offptr: ref.Args[0],
+					load:   ref,
+				},
+			}
+
+			newobjList = append(newobjList, newobj)
+			root := refMap[newobj.ret.load]
+			escapes(root)
+			esc := root.state == safe
+			log.Println("Is safe to be stack-allocated?", esc)
+		}
+	}
+
+	for _, n := range newobjList {
+		if refMap[n.ret.load].state == safe {
+			// Both Store and StaticCall change the memory state. Thus, we need
+			// to update the memory state passed to the args of each reference
+			// to these two values. Since they both will be removed, the
+			// current memory state will be that referenced by the store op.
+			prevMemState := n.call.store.Args[2]
+
+			storeRefs := unwrapRefs(refMap[n.call.store].references)
+			revertMemState(prevMemState, n.call.store, storeRefs)
+
+			staticcallRefs := unwrapRefs(refMap[n.call.staticcall].references)
+			revertMemState(prevMemState, n.call.staticcall, staticcallRefs)
+
+			// Load will be converted to OffPtr
+			sp := n.call.offptr.Args[0]
+			convertLoad(n.ret.load, sp)
+
+			// Each value related to heap alloc must be reseted.
+			cleanNewobj(n)
+		}
+	}
+}
 
 func isHeapAlloc(v *Value) bool {
 	switch aux := v.Aux.(type) {
@@ -62,7 +129,7 @@ func findRefs(f *Func) map[*Value]*escapeNode {
 		for _, v := range b.Values {
 			refMap[v] = &escapeNode{
 				value:      v,
-				kind:       unchecked,
+				state:      unchecked,
 				references: []*escapeNode{},
 			}
 		}
@@ -83,67 +150,42 @@ func findRefs(f *Func) map[*Value]*escapeNode {
 	return refMap
 }
 
-// escapeAnalysis walks through the values of a function f to determine whether
-// a value can safely be allocated on the stack or it escapes to the heap. This
-// complements the escape analysis applied to the AST.
-func escapeAnalysis(f *Func) {
-	if f.Name != "foo" {
-		return
+// Get the proper reference values from within a list of node.
+func unwrapRefs(nodes []*escapeNode) (refs []*Value) {
+	for _, n := range nodes {
+		refs = append(refs, n.value)
 	}
 
-	// Init refMap and keep track of each reference to a value.
-	refMap := findRefs(f)
+	return
+}
 
-	// Keep track of each heap allocation to rewrite later.
-	heapAllocs := []newobject{}
-
-	// Lookup for calls to runtime.newobject (i.e. heap allocations).
-	for _, b := range f.Blocks {
-		for _, v := range b.Values {
-			if !isHeapAlloc(v) {
-				continue
-			}
-
-			ref := refMap[v].references[0].value
-			newobj := newobject{
-				call: newobjectCall{
-					addr:   v.Args[0].Args[1],
-					offptr: v.Args[0].Args[0],
-					store:  v.Args[0],
-					call:   v,
-				},
-				ret: newobjectRet{
-					offptr: ref.Args[0],
-					load:   ref,
-				},
-			}
-
-			heapAllocs = append(heapAllocs, newobj)
-			root := refMap[newobj.ret.load]
-			escapes(root)
-			esc := root.kind == safe
-			log.Println("Is safe to be stack-allocated?", esc)
-		}
+// Update the mem state with a previous state passed by param and remove the
+// old state from ref args.
+func revertMemState(mem, value *Value, references []*Value) {
+	for _, ref := range references {
+		ref.Args[len(ref.Args)-1] = mem // Mem state is always the last arg (?)
+		value.Uses--
 	}
+}
 
-	for _, h := range heapAllocs {
-		if refMap[h.ret.load].kind == safe {
-			_ = h.call.offptr.Args[0]
+// Convert load value to a offptr.
+func convertLoad(load, sp *Value) {
+	t := load.Type
+	s := t.Elem().Size()
 
-			// Load will be converted to OffPtr
-			// h.ret.load.reset(OpOffPtr)
-			// h.ret.load.AddArg(sp)
-			// h.ret.load.AuxInt = h.ret.load.Type.Size()
-			// h.ret.load.Type = types.NewPtr(h.ret.load.Type)
+	load.reset(OpOffPtr)
+	load.Type = t
+	load.AuxInt = s
+	load.AddArg(sp)
+}
 
-			// Each value related to heap alloc must be reseted.
-			// h.ret.offptr.resetArgs()
-			// h.call.call.resetArgs()
-			// h.call.store.resetArgs()
-			// h.call.offptr.resetArgs()
-			// h.call.addr.resetArgs()
-		}
-	}
+// Remove the heap alloc that was replaced by a safe stack alloc.
+func cleanNewobj(n newobject) {
+	n.ret.offptr.reset(OpUnknown)
+	n.call.staticcall.reset(OpUnknown)
+	n.call.store.reset(OpUnknown)
+	n.call.offptr.reset(OpUnknown)
+	n.call.addr.reset(OpUnknown)
 }
 
 func escapes(node *escapeNode) {
@@ -164,12 +206,12 @@ func escapes(node *escapeNode) {
 		for _, ref := range node.references {
 			analyzeNode(node, ref)
 
-			if node.kind == mayEscape {
+			if node.state == mayEscape {
 				escapes(ref)
-				node.kind = ref.kind
+				node.state = ref.state
 			}
 
-			if node.kind == mustEscape {
+			if node.state == mustEscape {
 				break
 			}
 		}
@@ -179,8 +221,8 @@ func escapes(node *escapeNode) {
 // Check whether a node need to be analyzed or not.
 func needAnalysis(node *escapeNode) (need bool) {
 	// Node was already checked and thus we know if it can escape or not.
-	if node.kind != unchecked {
-		need = node.kind == safe
+	if node.state != unchecked {
+		need = node.state == safe
 		return
 	}
 
@@ -213,7 +255,7 @@ func analyzeLeaf(node *escapeNode) {
 	case OpStore:
 		gcnode, ok := node.value.Args[0].Aux.(GCNode)
 		if !(ok && gcnode.StorageClass() == ClassParamOut) {
-			node.kind = safe
+			node.state = safe
 			return
 		}
 
@@ -221,10 +263,10 @@ func analyzeLeaf(node *escapeNode) {
 		// is an address then the root node must escape for sure.
 		switch node.value.Args[1].Type.Etype {
 		case types.TUINTPTR, types.TPTR, types.TUNSAFEPTR:
-			node.kind = mustEscape
+			node.state = mustEscape
 
 		default:
-			node.kind = safe
+			node.state = safe
 		}
 	}
 }
@@ -238,13 +280,13 @@ func analyzeNode(node, ref *escapeNode) {
 		// We only care for write operations, so to v escapes it first needs to
 		// be being written to another value (i.e. appears as Args[1]).
 		if node.value != ref.value.Args[1] {
-			node.kind = safe
+			node.state = safe
 			return
 		}
 
 		gcnode, ok := ref.value.Args[0].Aux.(GCNode)
 		if !(ok && gcnode.StorageClass() == ClassParamOut) {
-			node.kind = mayEscape
+			node.state = mayEscape
 			return
 		}
 
@@ -252,28 +294,28 @@ func analyzeNode(node, ref *escapeNode) {
 		// is an address then the root node must escape for sure.
 		switch ref.value.Args[1].Type.Etype {
 		case types.TUINTPTR, types.TPTR, types.TUNSAFEPTR:
-			node.kind = mustEscape
+			node.state = mustEscape
 
 		default:
-			node.kind = safe
+			node.state = safe
 		}
 
 	case OpCopy:
-		node.kind = mayEscape
+		node.state = mayEscape
 
 	case OpLoad:
 		// If the returned type of OpLoad is a pointer, than it may be being
 		// used for something like a return or assignment to a global variable.
 		switch ref.value.Type.Etype {
 		case types.TUINTPTR, types.TPTR, types.TUNSAFEPTR:
-			node.kind = mayEscape
+			node.state = mayEscape
 		default:
-			node.kind = safe
+			node.state = safe
 		}
 
 	default:
 		// Set default as "must escape" to prevent from stack-allocating
 		// something erroneously.
-		node.kind = mustEscape
+		node.state = mustEscape
 	}
 }
