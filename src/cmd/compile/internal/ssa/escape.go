@@ -102,7 +102,7 @@ func escapeAnalysis(f *Func) {
 
 			// Load will be converted to OffPtr
 			sp := n.call.offptr.Args[0]
-			convertLoad(n.ret.load, sp)
+			convertLoad(n.ret.load, sp, n.call.offptr.AuxInt)
 
 			// Each value related to heap alloc must be reseted.
 			cleanNewobj(n)
@@ -169,13 +169,11 @@ func revertMemState(mem, value *Value, references []*Value) {
 }
 
 // Convert load value to a offptr.
-func convertLoad(load, sp *Value) {
-	t := load.Type
-	s := t.Elem().Size()
-
+func convertLoad(load, sp *Value, offset int64) {
+	typ := load.Type
 	load.reset(OpOffPtr)
-	load.Type = t
-	load.AuxInt = s
+	load.Type = typ
+	load.AuxInt = offset
 	load.AddArg(sp)
 }
 
