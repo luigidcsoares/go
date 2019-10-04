@@ -29,6 +29,7 @@ type (
 
 	escapeNode struct {
 		value      *Value
+		block      *Block
 		references []*escapeNode
 		state      nodeState
 	}
@@ -51,8 +52,8 @@ func escapeAnalysis(f *Func) {
 		return
 	}
 
-	// Init refMap and keep track of each reference to a value.
-	refMap := findRefs(f)
+	// Init refmap and keep track of each reference to a value.
+	refmap := findRefs(f)
 
 	// Keep track of each heap allocation to rewrite later.
 	newobjList := []newobject{}
@@ -64,7 +65,7 @@ func escapeAnalysis(f *Func) {
 				continue
 			}
 
-			ref := refMap[v].references[0].value
+			ref := refmap[v].references[0].value
 			newobj := newobject{
 				call: newobjectCall{
 					addr:       v.Args[0].Args[1],
@@ -79,7 +80,7 @@ func escapeAnalysis(f *Func) {
 			}
 
 			newobjList = append(newobjList, newobj)
-			root := refMap[newobj.ret.load]
+			root := refmap[newobj.ret.load]
 			escapes(root)
 			esc := root.state == safe
 			log.Println("Is safe to be stack-allocated?", esc)
@@ -87,25 +88,22 @@ func escapeAnalysis(f *Func) {
 	}
 
 	for _, n := range newobjList {
-		if refMap[n.ret.load].state == safe {
-			// Both Store and StaticCall change the memory state. Thus, we need
-			// to update the memory state passed to the args of each reference
-			// to these two values. Since they both will be removed, the
-			// current memory state will be that referenced by the store op.
-			prevMemState := n.call.store.Args[2]
+		if refmap[n.ret.load].state == safe {
+			// Create new var and convert load to a new stack-allocated var.
+			node := f.Frontend().Auto(n.ret.load.Pos, n.ret.load.Type)
+			mem := n.ret.load.Block.NewValue1A(
+				n.ret.load.Pos,
+				OpVarDef,
+				types.TypeMem,
+				node,
+				n.call.store.MemoryArg(),
+			)
 
-			storeRefs := unwrapRefs(refMap[n.call.store].references)
-			revertMemState(prevMemState, n.call.store, storeRefs)
-
-			staticcallRefs := unwrapRefs(refMap[n.call.staticcall].references)
-			revertMemState(prevMemState, n.call.staticcall, staticcallRefs)
-
-			// Load will be converted to OffPtr
 			sp := n.call.offptr.Args[0]
-			convertLoad(n.ret.load, sp, n.call.offptr.AuxInt)
+			newStackAlloc(n.ret.load, sp, mem, node)
 
 			// Each value related to heap alloc must be reseted.
-			cleanNewobj(n)
+			elimHeapAlloc(n, refmap, mem)
 		}
 	}
 }
@@ -122,13 +120,14 @@ func isHeapAlloc(v *Value) bool {
 
 // Keep track of each reference to a value.
 func findRefs(f *Func) map[*Value]*escapeNode {
-	refMap := map[*Value]*escapeNode{}
+	refmap := map[*Value]*escapeNode{}
 
-	// Initialize refMap.
+	// Initialize refmap.
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
-			refMap[v] = &escapeNode{
+			refmap[v] = &escapeNode{
 				value:      v,
+				block:      b,
 				state:      unchecked,
 				references: []*escapeNode{},
 			}
@@ -139,51 +138,48 @@ func findRefs(f *Func) map[*Value]*escapeNode {
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
 			for _, arg := range v.Args {
-				refMap[arg].references = append(
-					refMap[arg].references,
-					refMap[v],
+				refmap[arg].references = append(
+					refmap[arg].references,
+					refmap[v],
 				)
 			}
 		}
 	}
 
-	return refMap
+	return refmap
 }
 
-// Get the proper reference values from within a list of node.
-func unwrapRefs(nodes []*escapeNode) (refs []*Value) {
-	for _, n := range nodes {
-		refs = append(refs, n.value)
-	}
-
-	return
-}
-
-// Update the mem state with a previous state passed by param and remove the
-// old state from ref args.
-func revertMemState(mem, value *Value, references []*Value) {
-	for _, ref := range references {
-		ref.Args[len(ref.Args)-1] = mem // Mem state is always the last arg (?)
-		value.Uses--
-	}
-}
-
-// Convert load value to a offptr.
-func convertLoad(load, sp *Value, offset int64) {
-	typ := load.Type
-	load.reset(OpOffPtr)
-	load.Type = typ
-	load.AuxInt = offset
-	load.AddArg(sp)
+// Convert load value to a localaddr.
+func newStackAlloc(load, sp, mem *Value, node GCNode) {
+	load.reset(OpLocalAddr)
+	load.AddArgs(sp, mem)
+	load.Aux = node
 }
 
 // Remove the heap alloc that was replaced by a safe stack alloc.
-func cleanNewobj(n newobject) {
-	n.ret.offptr.reset(OpUnknown)
-	n.call.staticcall.reset(OpUnknown)
-	n.call.store.reset(OpUnknown)
-	n.call.offptr.reset(OpUnknown)
-	n.call.addr.reset(OpUnknown)
+func elimHeapAlloc(n newobject, refmap map[*Value]*escapeNode, mem *Value) {
+	// Update mem state (store value).
+	ref := refmap[n.call.staticcall].references[1].value
+	ref.SetArg(len(ref.Args)-1, mem)
+
+	// Force StaticCall to be considered as deadcode.
+	n.call.staticcall.reset(OpInvalid)
+
+	// Reset the remaining heap-alloc call values.
+	n.call.store.resetArgs()
+	n.call.addr.resetArgs()
+
+	if isDead(n.call.offptr) {
+		n.call.offptr.resetArgs()
+	}
+
+	if isDead(n.ret.offptr) {
+		n.ret.offptr.resetArgs()
+	}
+}
+
+func isDead(v *Value) bool {
+	return v.Uses == 0
 }
 
 func escapes(node *escapeNode) {
@@ -266,6 +262,9 @@ func analyzeLeaf(node *escapeNode) {
 		default:
 			node.state = safe
 		}
+
+	default:
+		node.state = safe
 	}
 }
 
@@ -312,8 +311,6 @@ func analyzeNode(node, ref *escapeNode) {
 		}
 
 	default:
-		// Set default as "must escape" to prevent from stack-allocating
-		// something erroneously.
-		node.state = mustEscape
+		node.state = mayEscape
 	}
 }
