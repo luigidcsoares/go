@@ -45,14 +45,14 @@ const (
 )
 
 // escapeAnalysis walks through the values of a function f to determine whether
-// a value can safely be allocated on the stack or it escapes to the heap. This
+// a value can safely be stack-allocated or it really escapes to the heap. This
 // complements the escape analysis applied to the AST.
 func escapeAnalysis(f *Func) {
 	if f.Name != "foo" {
 		return
 	}
 
-	// Init refmap and keep track of each reference to a value.
+	// Init refmap to keep track of each reference to a value.
 	refmap := findRefs(f)
 
 	// Keep track of each heap allocation to rewrite later.
@@ -82,6 +82,8 @@ func escapeAnalysis(f *Func) {
 			newobjList = append(newobjList, newobj)
 			root := refmap[newobj.ret.load]
 			escapes(root)
+
+			// TODO: REMOVE!!!!
 			esc := root.state == safe
 			log.Println("Is safe to be stack-allocated?", esc)
 		}
@@ -218,7 +220,8 @@ func isDead(v *Value) bool {
 }
 
 func escapes(node *escapeNode) {
-	if !mustVisit(node) {
+	preVisit(node)
+	if node.state != mayEscape {
 		return
 	}
 
@@ -248,31 +251,28 @@ func escapes(node *escapeNode) {
 }
 
 // Check whether a node need to be analyzed or not.
-func mustVisit(node *escapeNode) (must bool) {
-	// Node was already checked and thus we know if it can escape or not.
+func preVisit(node *escapeNode) {
+	// Node was already checked and thus we know if it must escape or not.
 	if node.state != unchecked {
-		must = node.state == mayEscape
 		return
 	}
 
 	switch node.value.Type.Etype {
 	case types.TUINTPTR, types.TPTR, types.TUNSAFEPTR:
-		must = true
+		node.state = mayEscape
 
 	case types.TSSA:
 		if node.value.Type.Extra.(string) != "mem" {
-			must = false
+			node.state = safe
 		} else {
-			must = true
+			node.state = mayEscape
 		}
 
 	default:
 		// If v doesn't neither hold an address or changes memory state then
-		// there's no chance to escape.a
-		must = false
+		// there's no chance to escape.
+		node.state = safe
 	}
-
-	return
 }
 
 // Since we're already in a leaf that means we cannot postpone the decision
