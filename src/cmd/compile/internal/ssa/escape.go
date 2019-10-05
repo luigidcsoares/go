@@ -32,6 +32,7 @@ type (
 		block      *Block
 		references []*escapeNode
 		state      nodeState
+		global     bool
 	}
 
 	nodeState = uint8
@@ -130,6 +131,7 @@ func findRefs(f *Func) map[*Value]*escapeNode {
 				block:      b,
 				state:      unchecked,
 				references: []*escapeNode{},
+				global:     v.Op == OpAddr,
 			}
 		}
 	}
@@ -138,6 +140,9 @@ func findRefs(f *Func) map[*Value]*escapeNode {
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
 			for _, arg := range v.Args {
+				// If arg refers to a global, the same is true for v.
+				refmap[v].global = refmap[v].global ||
+					(refmap[arg].global && !isRead(v, arg))
 				refmap[arg].references = append(
 					refmap[arg].references,
 					refmap[v],
@@ -147,6 +152,18 @@ func findRefs(f *Func) map[*Value]*escapeNode {
 	}
 
 	return refmap
+}
+
+// Check if an arg is somehow being read.
+func isRead(v, arg *Value) bool {
+	switch v.Op {
+	case OpStore:
+		return v.Args[1] == arg
+	case OpCopy:
+		return true
+	default:
+		return false
+	}
 }
 
 // Convert load value to a localaddr.
@@ -189,7 +206,7 @@ func escapes(node *escapeNode) {
 
 	if len(node.references) == 0 {
 		// If value doesn't have any child, it's a leaf. That means that we
-		// cannot postergate the decision and thus "analyzeLeaf" must return
+		// cannot postpone the decision and thus "analyzeLeaf" must return
 		// either "safe" or "mustEscape".
 		analyzeLeaf(node)
 
@@ -241,28 +258,13 @@ func needAnalysis(node *escapeNode) (need bool) {
 	return
 }
 
-// Since we're already in a leaf that means we cannot postergate the decision
+// Since we're already in a leaf that means we cannot postpone the decision
 // and thus we must return either "safe" or "mustEscape" (there's no place for
 // "mayEscape" in this function).
 func analyzeLeaf(node *escapeNode) {
 	switch node.value.Op {
 	case OpStore:
-		gcnode, ok := node.value.Args[0].Aux.(GCNode)
-		if !(ok && gcnode.StorageClass() == ClassParamOut) {
-			node.state = safe
-			return
-		}
-
-		// If Args[0] class is ParamOut and the value being returned (Args[1])
-		// is an address then the root node must escape for sure.
-		switch node.value.Args[1].Type.Etype {
-		case types.TUINTPTR, types.TPTR, types.TUNSAFEPTR:
-			node.state = mustEscape
-
-		default:
-			node.state = safe
-		}
-
+		checkOpStore(node, node, false)
 	default:
 		node.state = safe
 	}
@@ -273,39 +275,18 @@ func analyzeLeaf(node *escapeNode) {
 func analyzeNode(node, ref *escapeNode) {
 	switch ref.value.Op {
 	case OpStore:
-
-		// We only care for write operations, so to v escapes it first needs to
-		// be being written to another value (i.e. appears as Args[1]).
-		if node.value != ref.value.Args[1] {
-			node.state = safe
-			return
-		}
-
-		gcnode, ok := ref.value.Args[0].Aux.(GCNode)
-		if !(ok && gcnode.StorageClass() == ClassParamOut) {
-			node.state = mayEscape
-			return
-		}
-
-		// If Args[0] class is ParamOut and the value being returned (Args[1])
-		// is an address then the root node must escape for sure.
-		switch ref.value.Args[1].Type.Etype {
-		case types.TUINTPTR, types.TPTR, types.TUNSAFEPTR:
-			node.state = mustEscape
-
-		default:
-			node.state = safe
-		}
+		checkOpStore(node, ref, true)
 
 	case OpCopy:
 		node.state = mayEscape
 
 	case OpLoad:
-		// If the returned type of OpLoad is a pointer, than it may be being
-		// used for something like a return or assignment to a global variable.
 		switch ref.value.Type.Etype {
 		case types.TUINTPTR, types.TPTR, types.TUNSAFEPTR:
+			// If the returned type of OpLoad is a pointer, than it may be being
+			// used for something like a return or assignment to a global variable.
 			node.state = mayEscape
+
 		default:
 			node.state = safe
 		}
@@ -313,4 +294,39 @@ func analyzeNode(node, ref *escapeNode) {
 	default:
 		node.state = mayEscape
 	}
+}
+
+func checkOpStore(node, ref *escapeNode, postpone bool) {
+	// We only care for read ops (i.e. node.value at args[1]) where the
+	// type is a pointer to something.
+	if !isRead(ref.value, node.value) {
+		node.state = safe
+		return
+	}
+
+	switch ref.value.Args[1].Type.Etype {
+	case types.TUINTPTR, types.TPTR, types.TUNSAFEPTR:
+		gcnode, ok := ref.value.Args[0].Aux.(GCNode)
+
+		if ok && gcnode.StorageClass() == ClassParamOut {
+			// Args[0] class is ParamOut and the value being returned (Args[1])
+			// is an address then the root node must escape for sure.
+			node.state = mustEscape
+
+		} else if ref.global {
+			// Global means that this value is somehow related to a global
+			// variable defined elsewhere.
+			node.state = mustEscape
+
+		} else if postpone {
+			node.state = mayEscape
+
+		} else {
+			node.state = safe
+		}
+
+	default:
+		node.state = safe
+	}
+
 }
