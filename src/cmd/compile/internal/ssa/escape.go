@@ -32,7 +32,6 @@ type (
 		block      *Block
 		references []*escapeNode
 		state      nodeState
-		global     bool
 	}
 
 	nodeState = uint8
@@ -131,8 +130,9 @@ func findRefs(f *Func) map[*Value]*escapeNode {
 				block:      b,
 				state:      unchecked,
 				references: []*escapeNode{},
-				global:     v.Op == OpAddr,
 			}
+
+			precheckVal(refmap[v])
 		}
 	}
 
@@ -140,18 +140,31 @@ func findRefs(f *Func) map[*Value]*escapeNode {
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
 			for _, arg := range v.Args {
-				// If arg refers to a global, the same is true for v.
-				refmap[v].global = refmap[v].global ||
-					(refmap[arg].global && !isRead(v, arg))
 				refmap[arg].references = append(
 					refmap[arg].references,
 					refmap[v],
 				)
+
+				precheckArg(refmap[v], refmap[arg])
 			}
 		}
 	}
 
 	return refmap
+}
+
+func precheckVal(node *escapeNode) {
+	if isGlobal(node.value) {
+		node.state = mayEscape
+	}
+}
+
+func precheckArg(node, arg *escapeNode) {
+	if arg.state == mustEscape ||
+		isGlobal(arg.value) && !isRead(node.value, arg.value) {
+
+		node.state = mustEscape
+	}
 }
 
 // Check if an arg is somehow being read.
@@ -164,6 +177,11 @@ func isRead(v, arg *Value) bool {
 	default:
 		return false
 	}
+}
+
+// Check if v is a global var.
+func isGlobal(v *Value) bool {
+	return v.Op == OpAddr
 }
 
 // Convert load value to a localaddr.
@@ -200,22 +218,22 @@ func isDead(v *Value) bool {
 }
 
 func escapes(node *escapeNode) {
-	if !needAnalysis(node) {
+	if !mustVisit(node) {
 		return
 	}
 
 	if len(node.references) == 0 {
 		// If value doesn't have any child, it's a leaf. That means that we
-		// cannot postpone the decision and thus "analyzeLeaf" must return
+		// cannot postpone the decision and thus "visitLeaf" must return
 		// either "safe" or "mustEscape".
-		analyzeLeaf(node)
+		visitLeaf(node)
 
 	} else {
 		// Else we need to check each reference to value v. We're doing this by
 		// means of a DFS-like algorithm. Edges will be cutted if we found a
 		// "mustEscape" value.
 		for _, ref := range node.references {
-			analyzeNode(node, ref)
+			visitNode(node, ref)
 
 			if node.state == mayEscape {
 				escapes(ref)
@@ -230,29 +248,28 @@ func escapes(node *escapeNode) {
 }
 
 // Check whether a node need to be analyzed or not.
-func needAnalysis(node *escapeNode) (need bool) {
+func mustVisit(node *escapeNode) (must bool) {
 	// Node was already checked and thus we know if it can escape or not.
 	if node.state != unchecked {
-		need = node.state == safe
+		must = node.state == mayEscape
 		return
 	}
 
 	switch node.value.Type.Etype {
 	case types.TUINTPTR, types.TPTR, types.TUNSAFEPTR:
-		// v must be analyzed
-		need = true
+		must = true
 
 	case types.TSSA:
 		if node.value.Type.Extra.(string) != "mem" {
-			need = false
+			must = false
 		} else {
-			need = true
+			must = true
 		}
 
 	default:
 		// If v doesn't neither hold an address or changes memory state then
 		// there's no chance to escape.a
-		need = false
+		must = false
 	}
 
 	return
@@ -261,18 +278,18 @@ func needAnalysis(node *escapeNode) (need bool) {
 // Since we're already in a leaf that means we cannot postpone the decision
 // and thus we must return either "safe" or "mustEscape" (there's no place for
 // "mayEscape" in this function).
-func analyzeLeaf(node *escapeNode) {
-	switch node.value.Op {
+func visitLeaf(leaf *escapeNode) {
+	switch leaf.value.Op {
 	case OpStore:
-		checkOpStore(node, node, false)
+		checkOpStore(leaf, leaf, false)
 	default:
-		node.state = safe
+		leaf.state = safe
 	}
 }
 
 // Check if there's any chance to a value escapes from the function considering
 // a reference to v.
-func analyzeNode(node, ref *escapeNode) {
+func visitNode(node, ref *escapeNode) {
 	switch ref.value.Op {
 	case OpStore:
 		checkOpStore(node, ref, true)
@@ -298,7 +315,7 @@ func analyzeNode(node, ref *escapeNode) {
 
 func checkOpStore(node, ref *escapeNode, postpone bool) {
 	// We only care for read ops (i.e. node.value at args[1]) where the
-	// type is a pointer to something.
+	// type is a ptr to something.
 	if !isRead(ref.value, node.value) {
 		node.state = safe
 		return
@@ -310,17 +327,10 @@ func checkOpStore(node, ref *escapeNode, postpone bool) {
 
 		if ok && gcnode.StorageClass() == ClassParamOut {
 			// Args[0] class is ParamOut and the value being returned (Args[1])
-			// is an address then the root node must escape for sure.
+			// is an address, thus the root node must escape for sure.
 			node.state = mustEscape
-
-		} else if ref.global {
-			// Global means that this value is somehow related to a global
-			// variable defined elsewhere.
-			node.state = mustEscape
-
 		} else if postpone {
 			node.state = mayEscape
-
 		} else {
 			node.state = safe
 		}
