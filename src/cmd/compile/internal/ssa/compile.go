@@ -395,7 +395,7 @@ commas. For example:
 
 // list of passes for the compiler
 var passes = [...]pass{
-	{name: "escape analysis", fn: escapeAnalysis, required: true},
+	{name: "escape analysis", fn: escapes, required: true},
 	// TODO: combine phielim and copyelim into a single pass?
 	{name: "number lines", fn: numberLines, required: true},
 	{name: "early phielim", fn: phielim},
