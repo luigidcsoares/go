@@ -33,7 +33,6 @@ type (
 
 	escapeNode struct {
 		value      *Value
-		block      *Block
 		references []*escapeNode
 		state      nodeState
 	}
@@ -52,6 +51,7 @@ const (
 // a value can safely be stack-allocated or it really escapes to the heap. This
 // complements the escape analysis applied to the AST.
 func escapes(f *Func) {
+	// TODO: REMOVE!!!!!
 	if f.Name != "foo" {
 		return
 	}
@@ -70,15 +70,14 @@ func escapes(f *Func) {
 			}
 
 			var load *Value
-			for _, ref := range refmap[v].references {
-				v := ref.value
-				if v.Op == OpLoad && v.Args[0].Op == OpOffPtr {
-					load = v
-				}
-			}
 
-			if load == nil {
-				log.Fatal("cannot found load related to runtime.newobject")
+			// There's no guarantee that the OpLoad will be the first reference
+			// so we need to run through the list.
+			for _, r := range refmap[v].references {
+				if r.value.Op == OpLoad {
+					load = r.value
+					break
+				}
 			}
 
 			newobj := newobject{
@@ -98,7 +97,7 @@ func escapes(f *Func) {
 			root := refmap[newobj.ret.load]
 			bfs(root)
 
-			// TODO: REMOVE!!!!
+			// TODO: REMOVE!!!!!
 			esc := root.state == safe
 			log.Println("Is safe to be stack-allocated?", esc)
 		}
@@ -106,22 +105,35 @@ func escapes(f *Func) {
 
 	for _, n := range newobjList {
 		if refmap[n.ret.load].state == safe {
-			// Create new var and convert load to a new stack-allocated var.
-			log.Println(f.Name, refmap[n.ret.load].value.LongString())
-			node := f.Frontend().Auto(n.ret.load.Pos, n.ret.load.Type)
-			mem := n.ret.load.Block.NewValue1A(
-				n.ret.load.Pos,
-				OpVarDef,
-				types.TypeMem,
-				node,
-				n.call.store.MemoryArg(),
-			)
-
 			sp := n.call.offptr.Args[0]
-			newStackAlloc(n.ret.load, sp, mem, node)
 
-			// Each value related to heap alloc must be reseted.
-			elimHeapAlloc(n, refmap, mem)
+			// GCNode of the new stack-allocated var.
+			pos := n.ret.load.Pos
+			typ := n.ret.load.Type.Elem()
+			node := f.Frontend().Auto(pos, typ)
+
+			// Reuse staticcall as the new vardef value.
+			n.call.staticcall.reset(OpVarDef)
+			n.call.staticcall.Pos = pos
+			n.call.staticcall.Type = types.TypeMem
+			n.call.staticcall.AddArg(n.call.store.MemoryArg())
+			n.call.staticcall.Aux = node
+
+			// Reset the remaining heap-alloc values.
+			n.call.store.reset(OpInvalid)
+			n.call.addr.reset(OpInvalid)
+
+			if isDead(n.call.offptr) {
+				n.call.offptr.reset(OpInvalid)
+			}
+
+			if isDead(n.ret.offptr) {
+				n.ret.offptr.reset(OpInvalid)
+			}
+
+			n.ret.load.reset(OpLocalAddr)
+			n.ret.load.AddArgs(sp, n.call.staticcall)
+			n.ret.load.Aux = node
 		}
 	}
 }
@@ -145,7 +157,6 @@ func findRefs(f *Func) map[*Value]*escapeNode {
 		for _, v := range b.Values {
 			refmap[v] = &escapeNode{
 				value:      v,
-				block:      b,
 				state:      unchecked,
 				references: []*escapeNode{},
 			}
@@ -202,39 +213,6 @@ func isGlobal(v *Value) bool {
 	return v.Op == OpAddr
 }
 
-// Convert load value to a localaddr.
-func newStackAlloc(load, sp, mem *Value, node GCNode) {
-	load.reset(OpLocalAddr)
-	load.AddArgs(sp, mem)
-	load.Aux = node
-}
-
-// Remove the heap alloc that was replaced by a safe stack alloc.
-func elimHeapAlloc(n newobject, refmap map[*Value]*escapeNode, mem *Value) {
-	// Update mem state (store value).
-	refs := refmap[n.call.staticcall].references
-	for _, r := range refs {
-		if r.value != n.ret.load {
-			r.value.SetArg(len(r.value.Args)-1, mem)
-		}
-	}
-
-	// Force StaticCall to be considered as deadcode.
-	n.call.staticcall.reset(OpInvalid)
-
-	// Reset the remaining heap-alloc call values.
-	n.call.store.resetArgs()
-	n.call.addr.resetArgs()
-
-	if isDead(n.call.offptr) {
-		n.call.offptr.resetArgs()
-	}
-
-	if isDead(n.ret.offptr) {
-		n.ret.offptr.resetArgs()
-	}
-}
-
 func isDead(v *Value) bool {
 	return v.Uses == 0
 }
@@ -252,7 +230,6 @@ func bfs(root *escapeNode) {
 
 		// If node was already visited we only need to analyze it if its state
 		// is not a final state (safe or mustEscape).
-		root.state = node.state
 		if node.state == mustEscape {
 			break
 		}
@@ -301,16 +278,19 @@ func bfs(root *escapeNode) {
 func visitNode(node *escapeNode) {
 	switch node.value.Op {
 	case OpStore:
-		if node.value.Args[1].Type.IsPtr() {
-			gcnode, ok := node.value.Args[0].Aux.(GCNode)
+		if !node.value.Args[1].Type.IsPtr() {
+			node.state = safe
+			return
+		}
 
-			// If Args[0] class is ParamOut and the value being returned (Args[1])
-			// is an address, thus the root node must escape for sure. Else, we
-			// can guarantee the safety since curent node has no child.
-			if ok && gcnode.StorageClass() == ClassParamOut {
-				node.state = mustEscape
-				return
-			}
+		gcnode, ok := node.value.Args[0].Aux.(GCNode)
+
+		// If Args[0] class is ParamOut and the value being returned (Args[1])
+		// is an address, thus the root node must escape for sure. Else, we
+		// can guarantee the safety since curent node has no child.
+		if ok && gcnode.StorageClass() == ClassParamOut {
+			node.state = mustEscape
+			return
 		}
 	}
 
