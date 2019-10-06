@@ -99,7 +99,7 @@ func escapes(f *Func) {
 
 			// TODO: REMOVE!!!!!
 			esc := root.state == safe
-			log.Printf("%s: is %s safe to be stack-allocated? %t", f.Name, newobj.ret.load, esc)
+			log.Printf("%s: is %s safe to be stack-allocated? %t", f.Name, newobj.ret.load.LongString(), esc)
 		}
 	}
 
@@ -286,13 +286,19 @@ func bfs(root *escapeNode) {
 // visitNode is called when node doesn't have any children, so there's no
 // reason to return "mayEscape".
 func visitNode(node *escapeNode) {
+	if node.value.Op.IsCall() {
+		// TODO: There's any way to handle it?
+		node.state = mustEscape
+		return
+	}
+
+	node.state = checkType(node.value)
+	if node.state == safe {
+		return
+	}
+
 	switch node.value.Op {
 	case OpStore:
-		if !node.value.Args[1].Type.IsPtr() {
-			node.state = safe
-			return
-		}
-
 		gcnode, ok := node.value.Args[0].Aux.(GCNode)
 
 		// If Args[0] class is ParamOut and the value being returned (Args[1])
@@ -311,6 +317,10 @@ func visitNode(node *escapeNode) {
 // Check if there's any chance to a value escapes from the function considering
 // a reference to v.
 func visitChild(node, child *escapeNode) {
+	node.state = checkType(node.value)
+	if node.state == safe {
+		return
+	}
 
 	if child.value.Op.IsCall() {
 		// TODO: There's any way to handle it?
@@ -327,12 +337,6 @@ func visitChild(node, child *escapeNode) {
 			return
 		}
 
-		rarg := child.value.Args[1]
-		if !rarg.Type.IsPtr() && !rarg.Type.IsUnsafePtr() {
-			node.state = safe
-			return
-		}
-
 		// If Args[0] class is ParamOut and the value being returned (Args[1])
 		// is an address, thus the root node must escape for sure. Else, we
 		// cannot guarantee the safety.
@@ -345,12 +349,18 @@ func visitChild(node, child *escapeNode) {
 		// If the returned type of OpLoad is a pointer, than it may be being
 		// used for something like a return or assignment to a global variable.
 		// Else, we can guarantee the safety.
-		if !child.value.Type.IsPtr() || !child.value.Type.IsUnsafePtr() {
-			node.state = safe
-			return
-		}
+		node.state = checkType(child.value)
+		return
 	}
 
 	// Default value for visitChild.
 	node.state = mayEscape
+}
+
+func checkType(value *Value) nodeState {
+	if value.Type.IsPtr() || value.Type.IsUnsafePtr() || value.Type.IsMemory() {
+		return mayEscape
+	}
+
+	return safe
 }
