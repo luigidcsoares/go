@@ -99,7 +99,7 @@ func escapes(f *Func) {
 
 			// TODO: REMOVE!!!!!
 			esc := root.state == safe
-			log.Println("Is safe to be stack-allocated?", esc)
+			log.Printf("%s: is %s safe to be stack-allocated? %t", f.Name, newobj.ret.load, esc)
 		}
 	}
 
@@ -242,6 +242,11 @@ func bfs(root *escapeNode) {
 			visitNode(node)
 			root.state = node.state
 
+			// TODO: REMOVE!!!!!
+			// log.Println(node.value.LongString())
+			// log.Println(root.state)
+			// fmt.Println()
+
 			if root.state == mustEscape {
 				break
 			}
@@ -260,6 +265,12 @@ func bfs(root *escapeNode) {
 			visited[child] = true
 			root.state = node.state
 
+			// TODO: REMOVE!!!!!
+			// log.Println(node.value.LongString())
+			// log.Println(child.value.LongString())
+			// log.Println(root.state)
+			// fmt.Println()
+
 			if root.state == mayEscape {
 				queue = append(queue, child)
 			}
@@ -270,7 +281,6 @@ func bfs(root *escapeNode) {
 			}
 		}
 	}
-
 }
 
 // visitNode is called when node doesn't have any children, so there's no
@@ -301,6 +311,13 @@ func visitNode(node *escapeNode) {
 // Check if there's any chance to a value escapes from the function considering
 // a reference to v.
 func visitChild(node, child *escapeNode) {
+
+	if child.value.Op.IsCall() {
+		// TODO: There's any way to handle it?
+		node.state = mustEscape
+		return
+	}
+
 	switch child.value.Op {
 	case OpStore:
 		// We only care for read ops (i.e. node.value at args[1]) where the
@@ -310,7 +327,8 @@ func visitChild(node, child *escapeNode) {
 			return
 		}
 
-		if !child.value.Args[1].Type.IsPtr() {
+		rarg := child.value.Args[1]
+		if !rarg.Type.IsPtr() && !rarg.Type.IsUnsafePtr() {
 			node.state = safe
 			return
 		}
@@ -327,7 +345,7 @@ func visitChild(node, child *escapeNode) {
 		// If the returned type of OpLoad is a pointer, than it may be being
 		// used for something like a return or assignment to a global variable.
 		// Else, we can guarantee the safety.
-		if !child.value.Type.IsPtr() {
+		if !child.value.Type.IsPtr() || !child.value.Type.IsUnsafePtr() {
 			node.state = safe
 			return
 		}
