@@ -71,8 +71,8 @@ func escapes(f *Func) {
 
 			var load *Value
 
-			// There's no guarantee that the OpLoad will be the first reference
-			// so we need to run through the list.
+			// There's no guarantee that the OpLoad will be the first
+			// reference.
 			for _, r := range refmap[v].references {
 				if r.value.Op == OpLoad {
 					load = r.value
@@ -95,7 +95,7 @@ func escapes(f *Func) {
 
 			newobjList = append(newobjList, newobj)
 			root := refmap[newobj.ret.load]
-			bfs(root)
+			dfs(root)
 
 			// TODO: REMOVE!!!!!
 			esc := root.state == safe
@@ -189,19 +189,21 @@ func precheckVal(node *escapeNode) {
 }
 
 func precheckArg(node, arg *escapeNode) {
-	if arg.state == mustEscape ||
-		isGlobal(arg.value) && !isRead(node.value, arg.value) {
+	if arg.state == mustEscape {
+		node.state = mustEscape
+		return
+	}
 
+	v, a := node.value, arg.value
+	if isGlobal(a) && isWriteOp(v) && a == v.Args[0] {
 		node.state = mustEscape
 	}
 }
 
-// Check if an arg is somehow being read.
-func isRead(v, arg *Value) bool {
+func isWriteOp(v *Value) bool {
+	// TODO: there's any other OP with write semantics?
 	switch v.Op {
-	case OpStore:
-		return v.Args[1] == arg
-	case OpCopy:
+	case OpStore, OpMove, OpZero, OpStoreWB, OpMoveWB, OpZeroWB:
 		return true
 	default:
 		return false
@@ -217,148 +219,118 @@ func isDead(v *Value) bool {
 	return v.Uses == 0
 }
 
-func bfs(root *escapeNode) {
-	// Create new queue and visited map for running bfs.
-	queue := []*escapeNode{root}
+func dfs(root *escapeNode) {
+	// Create new queue and visited map for running dfs.
+	stack := []*escapeNode{root}
 	visited := map[*escapeNode]bool{}
-	visited[root] = true
 
-	for len(queue) > 0 {
-		// Get the first element of the queue.
+	for len(stack) > 0 {
+		// Pop the first element from the stack.
 		var node *escapeNode
-		node, queue = queue[0], queue[1:]
+		node, stack = stack[len(stack)-1], stack[:len(stack)-1]
 
-		// If node was already visited we only need to analyze it if its state
-		// is not a final state (safe or mustEscape).
-		if node.state == mustEscape {
+		if visited[node] {
+			continue
+		}
+
+		visited[node] = true
+
+		// Already established that root must escape.
+		if root.state == mustEscape {
 			break
 		}
 
-		if node.state == safe {
-			continue
-		}
-
 		if len(node.references) == 0 {
-			visitNode(node)
-			root.state = node.state
+			checkNode(node)
 
-			// TODO: REMOVE!!!!!
-			// log.Println(node.value.LongString())
-			// log.Println(root.state)
-			// fmt.Println()
+		} else {
+			// Add node children to the stack.
+			stack = append(stack, node.references...)
 
-			if root.state == mustEscape {
-				break
-			}
-
-			continue
+			// Set the child as the first node in the stack and visit.
+			child := stack[len(stack)-1]
+			walk(node, child)
 		}
 
-		// Else we need to check each reference to value v. Edges will be
-		// cutted if we found a "mustEscape" value.
-		for _, child := range node.references {
-			if visited[child] {
-				continue
-			}
-
-			visitChild(node, child)
-			visited[child] = true
+		if node.state != mayEscape {
 			root.state = node.state
-
-			// TODO: REMOVE!!!!!
-			// log.Println(node.value.LongString())
-			// log.Println(child.value.LongString())
-			// log.Println(root.state)
-			// fmt.Println()
-
-			if root.state == mayEscape {
-				queue = append(queue, child)
-			}
-
-			if root.state == mustEscape {
-				queue = nil
-				break
-			}
 		}
 	}
 }
 
-// visitNode is called when node doesn't have any children, so there's no
+// visit is called when node doesn't have any children, so there's no
 // reason to return "mayEscape".
-func visitNode(node *escapeNode) {
+func checkNode(node *escapeNode) {
 	if node.value.Op.IsCall() {
 		// TODO: There's any way to handle it?
 		node.state = mustEscape
 		return
 	}
 
-	node.state = checkType(node.value)
-	if node.state == safe {
+	if !isWriteOp(node.value) {
+		node.state = safe
 		return
 	}
 
-	switch node.value.Op {
-	case OpStore:
-		gcnode, ok := node.value.Args[0].Aux.(GCNode)
-
-		// If Args[0] class is ParamOut and the value being returned (Args[1])
-		// is an address, thus the root node must escape for sure. Else, we
-		// can guarantee the safety since curent node has no child.
-		if ok && gcnode.StorageClass() == ClassParamOut {
-			node.state = mustEscape
-			return
-		}
+	if node.state = checkType(node.value, true); node.state == safe {
+		return
 	}
 
-	// Default value for visitNode.
-	node.state = safe
+	// TODO: Cover more cases!!!!!
+	if node.state = checkParam(node.value); node.state == mayEscape {
+		node.state = mustEscape
+	}
 }
 
-// Check if there's any chance to a value escapes from the function considering
+// Check if there's any chance of a value v to escape from the function considering
 // a reference to v.
-func visitChild(node, child *escapeNode) {
-	node.state = checkType(node.value)
-	if node.state == safe {
-		return
-	}
-
+func walk(node, child *escapeNode) {
 	if child.value.Op.IsCall() {
 		// TODO: There's any way to handle it?
 		node.state = mustEscape
 		return
 	}
 
-	switch child.value.Op {
-	case OpStore:
-		// We only care for read ops (i.e. node.value at args[1]) where the
-		// type is a ptr to something.
-		if !isRead(child.value, node.value) {
-			node.state = safe
-			return
-		}
-
-		// If Args[0] class is ParamOut and the value being returned (Args[1])
-		// is an address, thus the root node must escape for sure. Else, we
-		// cannot guarantee the safety.
-		gcnode, ok := child.value.Args[0].Aux.(GCNode)
-		if ok && gcnode.StorageClass() == ClassParamOut {
-			node.state = mustEscape
-		}
-
-	case OpLoad:
-		// If the returned type of OpLoad is a pointer, than it may be being
-		// used for something like a return or assignment to a global variable.
-		// Else, we can guarantee the safety.
-		node.state = checkType(child.value)
+	if isWriteOp(child.value) && child.value.Args[1] == node.value {
+		node.state = checkParam(child.value)
 		return
 	}
 
-	// Default value for visitChild.
-	node.state = mayEscape
+	// Look-ahead by checking the child value.
+	// TODO: Cover more cases!!!!!
+	node.state = checkType(child.value, false)
 }
 
-func checkType(value *Value) nodeState {
-	if value.Type.IsPtr() || value.Type.IsUnsafePtr() || value.Type.IsMemory() {
+func checkParam(v *Value) nodeState {
+	// If dst class is ParamOut and the value being assigned to it is an
+	// address, the root node must escape for sure.
+	dst := v.Args[0]
+
+	if n, ok := dst.Aux.(GCNode); ok && n.StorageClass() != ClassAuto {
+		var src *Value
+
+		switch v.Op {
+		case OpStore, OpMove, OpStoreWB, OpMoveWB:
+			src = v.Args[1]
+
+		case OpZero, OpZeroWB:
+			src = v.Args[0]
+		}
+
+		// Assign an address to a value that outlives de currfn is not at all
+		// safe.
+		if checkType(src, true) == mayEscape {
+			return mustEscape
+		}
+
+		return safe
+	}
+
+	return mayEscape
+}
+
+func checkType(v *Value, memsafe bool) nodeState {
+	if typ := v.Type; typ.HasNil() || (typ.IsMemory() && !memsafe) {
 		return mayEscape
 	}
 
