@@ -155,13 +155,16 @@ func findRefs(f *Func) map[*Value]*escapeNode {
 	// Initialize refmap.
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
-			refmap[v] = &escapeNode{
-				value:      v,
-				state:      unchecked,
-				references: []*escapeNode{},
+			s := unchecked
+			if outlives(v) {
+				s = mayEscape
 			}
 
-			precheckVal(refmap[v])
+			refmap[v] = &escapeNode{
+				value:      v,
+				state:      s,
+				references: []*escapeNode{},
+			}
 		}
 	}
 
@@ -174,7 +177,7 @@ func findRefs(f *Func) map[*Value]*escapeNode {
 					refmap[v],
 				)
 
-				precheckArg(refmap[v], refmap[arg])
+				outlivesArg(refmap[v], refmap[arg])
 			}
 		}
 	}
@@ -182,22 +185,27 @@ func findRefs(f *Func) map[*Value]*escapeNode {
 	return refmap
 }
 
-func precheckVal(node *escapeNode) {
-	if isGlobal(node.value) {
-		node.state = mayEscape
+// Check if v is somehow (arg) related to a global value or param/paramout.
+func outlivesArg(node, arg *escapeNode) {
+	v, a := node.value, arg.value
+	if arg.state == mustEscape || isWriteOp(v) && a == v.Args[0] && outlives(a) {
+		node.state = mustEscape
 	}
 }
 
-func precheckArg(node, arg *escapeNode) {
-	if arg.state == mustEscape {
-		node.state = mustEscape
-		return
+// Check if v is related to a global value or param/paramout.
+func outlives(v *Value) bool {
+	// OpAddr means that v is global.
+	if v.Op == OpAddr {
+		return true
 	}
 
-	v, a := node.value, arg.value
-	if isGlobal(a) && isWriteOp(v) && a == v.Args[0] {
-		node.state = mustEscape
+	// Value is param/paramout.
+	if n, ok := v.Aux.(GCNode); ok && n.StorageClass() != ClassAuto {
+		return n.Typ().IsPtr() || n.Typ().IsUnsafePtr()
 	}
+
+	return false
 }
 
 func isWriteOp(v *Value) bool {
@@ -208,11 +216,6 @@ func isWriteOp(v *Value) bool {
 	default:
 		return false
 	}
-}
-
-// Check if v is a global var.
-func isGlobal(v *Value) bool {
-	return v.Op == OpAddr
 }
 
 func isDead(v *Value) bool {
@@ -236,7 +239,8 @@ func dfs(root *escapeNode) {
 		visited[node] = true
 
 		// Already established that root must escape.
-		if root.state == mustEscape {
+		if root.state == mustEscape || node.state == mustEscape {
+			root.state = mustEscape
 			break
 		}
 
@@ -272,12 +276,8 @@ func checkNode(node *escapeNode) {
 		return
 	}
 
-	if node.state = checkType(node.value, true); node.state == safe {
-		return
-	}
-
 	// TODO: Cover more cases!!!!!
-	if node.state = checkParam(node.value); node.state == mayEscape {
+	if node.state = checkType(node.value, true); node.state == mayEscape {
 		node.state = mustEscape
 	}
 }
@@ -291,42 +291,9 @@ func walk(node, child *escapeNode) {
 		return
 	}
 
-	if isWriteOp(child.value) && child.value.Args[1] == node.value {
-		node.state = checkParam(child.value)
-		return
-	}
-
 	// Look-ahead by checking the child value.
 	// TODO: Cover more cases!!!!!
 	node.state = checkType(child.value, false)
-}
-
-func checkParam(v *Value) nodeState {
-	// If dst class is ParamOut and the value being assigned to it is an
-	// address, the root node must escape for sure.
-	dst := v.Args[0]
-
-	if n, ok := dst.Aux.(GCNode); ok && n.StorageClass() != ClassAuto {
-		var src *Value
-
-		switch v.Op {
-		case OpStore, OpMove, OpStoreWB, OpMoveWB:
-			src = v.Args[1]
-
-		case OpZero, OpZeroWB:
-			src = v.Args[0]
-		}
-
-		// Assign an address to a value that outlives de currfn is not at all
-		// safe.
-		if checkType(src, true) == mayEscape {
-			return mustEscape
-		}
-
-		return safe
-	}
-
-	return mayEscape
 }
 
 func checkType(v *Value, memsafe bool) nodeState {
