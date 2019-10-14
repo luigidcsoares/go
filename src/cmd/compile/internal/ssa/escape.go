@@ -7,6 +7,7 @@ package ssa
 import (
 	"cmd/compile/internal/types"
 	"cmd/internal/obj"
+	"fmt"
 	"strings"
 	"sync"
 )
@@ -58,6 +59,10 @@ const (
 // a value can safely be stack-allocated or it really escapes to the heap. This
 // complements the escape analysis applied to the AST.
 func escapes(f *Func) {
+	if f.Name != "foo" {
+		return
+	}
+
 	// Init refmap to keep track of each reference to a value.
 	refmap := findRefs(f)
 	setRegion(refmap)
@@ -95,6 +100,11 @@ func escapes(f *Func) {
 
 			root := refmap[newobj.ret.load]
 			walk(root, refmap)
+
+			if root.state == safe {
+				rewriteList = append(rewriteList, newobj)
+				fmt.Println(newobj.ret.load.LongString())
+			}
 		}
 	}
 
@@ -285,6 +295,11 @@ func visit(node *escapeNode, refmap map[*Value]*escapeNode) {
 		return
 	}
 
+	node.state = checkHeapPointer(node.value)
+	if node.state == mustEscape {
+		return
+	}
+
 	// TODO: there's any other OP with write semantics?
 	switch node.value.Op {
 	case OpStore, OpMove:
@@ -295,17 +310,40 @@ func visit(node *escapeNode, refmap map[*Value]*escapeNode) {
 			return
 		}
 
+		node.state = checkHeapPointer(src)
+		if node.state == mustEscape {
+			return
+		}
+
 		// Assigning address to a value that is outside of the curr fn.
-		if node.region == outside {
+		if refmap[dst].region == outside {
 			node.state = mustEscape
 			return
 		}
 
 		node.state = mayEscape
 
-	case OpLoad:
-		if !types.Haspointers(node.value.Type) {
+	default:
+		if t := node.value.Type; !types.Haspointers(t) && !t.IsMemory() {
 			node.state = safe
 		}
 	}
+}
+
+func checkHeapPointer(v *Value) (state nodeState) {
+	state = mayEscape
+	elem := v.Type
+
+	for elem.IsPtr() {
+		elem = elem.Elem()
+	}
+
+	if elem.HasHeapPointer() {
+		// v has some pointer to heap so we consider it as being
+		// outside of the curr fn.
+		// TODO: Try to relax this constraint a bit.
+		state = mustEscape
+	}
+
+	return
 }
