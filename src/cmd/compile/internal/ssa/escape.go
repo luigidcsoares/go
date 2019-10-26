@@ -8,6 +8,7 @@ import (
 	"cmd/compile/internal/types"
 	"cmd/internal/obj"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 )
@@ -59,51 +60,47 @@ const (
 // a value can safely be stack-allocated or it really escapes to the heap. This
 // complements the escape analysis applied to the AST.
 func escapes(f *Func) {
-	if f.Name != "foo" {
-		return
-	}
-
-	// Init refmap to keep track of each reference to a value.
-	refmap := findRefs(f)
-	setRegion(refmap)
+	graph := buildGraph(f)
+	setRegion(graph)
 
 	// Keep track of each heap allocation to rewrite later.
 	rewriteList := []newobject{}
 
 	// Lookup for calls to runtime.newobject (i.e. heap allocations).
-	for _, b := range f.Blocks {
-		for _, v := range b.Values {
-			if !isNewobjCall(v) {
-				continue
+	for v := range graph {
+		if !isNewobjCall(v) {
+			continue
+		}
+
+		var load *Value
+		for _, r := range graph[v].references {
+			if r.value.Op == OpLoad {
+				load = r.value
+				break
 			}
+		}
 
-			var load *Value
-			for _, r := range refmap[v].references {
-				if r.value.Op == OpLoad {
-					load = r.value
-					break
-				}
-			}
+		newobj := newobject{
+			call: newobjectCall{
+				addr:       v.Args[0].Args[1],
+				offptr:     v.Args[0].Args[0],
+				store:      v.Args[0],
+				staticcall: v,
+			},
+			ret: newobjectRet{
+				offptr: load.Args[0],
+				load:   load,
+			},
+		}
 
-			newobj := newobject{
-				call: newobjectCall{
-					addr:       v.Args[0].Args[1],
-					offptr:     v.Args[0].Args[0],
-					store:      v.Args[0],
-					staticcall: v,
-				},
-				ret: newobjectRet{
-					offptr: load.Args[0],
-					load:   load,
-				},
-			}
+		root := graph[newobj.ret.load]
+		walk(root, graph)
 
-			root := refmap[newobj.ret.load]
-			walk(root, refmap)
+		if root.state == safe {
+			rewriteList = append(rewriteList, newobj)
 
-			if root.state == safe {
-				rewriteList = append(rewriteList, newobj)
-				fmt.Println(newobj.ret.load.LongString())
+			if debug := os.Getenv("DEBUG"); strings.ToLower(debug) == "true" {
+				fmt.Println("REWRITE:", newobj.ret.load.LongString())
 			}
 		}
 	}
@@ -165,10 +162,10 @@ func isTypeAddr(v *Value) bool {
 }
 
 // Keep track of each reference to a value.
-func findRefs(f *Func) map[*Value]*escapeNode {
-	refmap := map[*Value]*escapeNode{}
+func buildGraph(f *Func) map[*Value]*escapeNode {
+	graph := map[*Value]*escapeNode{}
 
-	// Initialize refmap.
+	// Initialize graph.
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
 			r := inside
@@ -178,13 +175,13 @@ func findRefs(f *Func) map[*Value]*escapeNode {
 				r = outside
 			}
 
+			t := v.Type
 			n, ok := v.Aux.(GCNode)
-			if !v.Type.IsMemory() && ok && n.StorageClass() != ClassAuto {
-				// Param (in/out).
+			if !t.IsMemory() && ok && n.StorageClass() != ClassAuto && types.Haspointers(t) {
 				r = outside
 			}
 
-			refmap[v] = &escapeNode{
+			graph[v] = &escapeNode{
 				value:      v,
 				region:     r,
 				state:      mayEscape,
@@ -197,25 +194,25 @@ func findRefs(f *Func) map[*Value]*escapeNode {
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
 			for _, arg := range v.Args {
-				refmap[arg].references = append(
-					refmap[arg].references,
-					refmap[v],
+				graph[arg].references = append(
+					graph[arg].references,
+					graph[v],
 				)
 			}
 		}
 	}
 
-	return refmap
+	return graph
 }
 
-// Each entry of refmap can be thought as a directed graph where each arg of a
+// Each entry of graph can be thought as a directed graph where each arg of a
 // value v is onde node that connected to v. So, we run a DFS algorithm to
 // propagate the region of a parent node to its children, but must only update
 // outside regions.
-func setRegion(refmap map[*Value]*escapeNode) {
+func setRegion(graph map[*Value]*escapeNode) {
 	var wg sync.WaitGroup
 
-	for _, node := range refmap {
+	for _, node := range graph {
 		if node.region == inside {
 			continue
 		}
@@ -257,7 +254,7 @@ func setRegion(refmap map[*Value]*escapeNode) {
 	wg.Wait()
 }
 
-func walk(root *escapeNode, refmap map[*Value]*escapeNode) {
+func walk(root *escapeNode, graph map[*Value]*escapeNode) {
 	stack := []*escapeNode{}
 	visited := map[*escapeNode]bool{}
 
@@ -270,7 +267,7 @@ func walk(root *escapeNode, refmap map[*Value]*escapeNode) {
 			continue
 		}
 
-		visit(node, refmap)
+		visit(node, graph)
 		visited[node] = true
 
 		if node.state == mustEscape {
@@ -288,21 +285,17 @@ func walk(root *escapeNode, refmap map[*Value]*escapeNode) {
 	}
 }
 
-func visit(node *escapeNode, refmap map[*Value]*escapeNode) {
-	if node.value.Op.IsCall() {
-		// TODO: there's any way to handle it?
+func visit(node *escapeNode, graph map[*Value]*escapeNode) {
+	// We care only about function calls that somehow uses the root node value.
+	if node.value.Op.IsCall() && !isNewobjCall(node.value) {
+		// TODO: there's any way to handle this?
 		node.state = mustEscape
 		return
 	}
 
-	node.state = checkHeapPointer(node.value)
-	if node.state == mustEscape {
-		return
-	}
-
-	// TODO: there's any other OP with write semantics?
 	switch node.value.Op {
 	case OpStore, OpMove:
+		// TODO: there's any other OP with write semantics?
 		src, dst := node.value.Args[1], node.value.Args[0]
 
 		if !types.Haspointers(src.Type) {
@@ -310,35 +303,34 @@ func visit(node *escapeNode, refmap map[*Value]*escapeNode) {
 			return
 		}
 
-		node.state = checkHeapPointer(src)
-		if node.state == mustEscape {
-			return
-		}
-
 		// Assigning address to a value that is outside of the curr fn.
-		if refmap[dst].region == outside {
+		if graph[dst].region == outside {
 			node.state = mustEscape
 			return
 		}
 
-		node.state = mayEscape
+		node.state = checkHeapPointer(src.Type)
 
 	default:
-		if t := node.value.Type; !types.Haspointers(t) && !t.IsMemory() {
+		t := node.value.Type
+		if !types.Haspointers(t) && !t.IsMemory() {
 			node.state = safe
+			return
 		}
+
+		// TODO: Relax this constraint?
+		node.state = checkHeapPointer(t)
 	}
 }
 
-func checkHeapPointer(v *Value) (state nodeState) {
+func checkHeapPointer(t *types.Type) (state nodeState) {
 	state = mayEscape
-	elem := v.Type
 
-	for elem.IsPtr() {
-		elem = elem.Elem()
+	for t.IsPtr() {
+		t = t.Elem()
 	}
 
-	if elem.HasHeapPointer() {
+	if t.HasHeapPointer() {
 		// v has some pointer to heap so we consider it as being
 		// outside of the curr fn.
 		// TODO: Try to relax this constraint a bit.
