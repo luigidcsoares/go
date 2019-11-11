@@ -8,9 +8,7 @@ import (
 	"cmd/compile/internal/types"
 	"cmd/internal/obj"
 	"fmt"
-	"os"
 	"strings"
-	"sync"
 )
 
 type (
@@ -61,7 +59,7 @@ const (
 // complements the escape analysis applied to the AST.
 func escapes(f *Func) {
 	graph := buildGraph(f)
-	setRegion(graph)
+	propagRegion(graph)
 
 	// Keep track of each heap allocation to rewrite later.
 	rewriteList := []newobject{}
@@ -98,10 +96,7 @@ func escapes(f *Func) {
 
 		if root.state == safe {
 			rewriteList = append(rewriteList, newobj)
-
-			if debug := os.Getenv("DEBUG"); strings.ToLower(debug) == "true" {
-				fmt.Println("REWRITE:", newobj.ret.load.LongString())
-			}
+			fmt.Println("REWRITE:", newobj.ret.load.LongString())
 		}
 	}
 
@@ -168,22 +163,9 @@ func buildGraph(f *Func) map[*Value]*escapeNode {
 	// Initialize graph.
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
-			r := inside
-
-			if v.Op == OpAddr && !isTypeAddr(v) {
-				// Global value.
-				r = outside
-			}
-
-			t := v.Type
-			n, ok := v.Aux.(GCNode)
-			if !t.IsMemory() && ok && n.StorageClass() != ClassAuto && types.Haspointers(t) {
-				r = outside
-			}
-
 			graph[v] = &escapeNode{
 				value:      v,
-				region:     r,
+				region:     getRegion(v),
 				state:      mayEscape,
 				references: []*escapeNode{},
 			}
@@ -205,53 +187,61 @@ func buildGraph(f *Func) map[*Value]*escapeNode {
 	return graph
 }
 
-// Each entry of graph can be thought as a directed graph where each arg of a
-// value v is onde node that connected to v. So, we run a DFS algorithm to
-// propagate the region of a parent node to its children, but must only update
-// outside regions.
-func setRegion(graph map[*Value]*escapeNode) {
-	var wg sync.WaitGroup
+func hasElem(t *types.Type) bool {
+	return t.IsPtr() || t.IsSlice() || t.IsMap() || t.IsArray()
+}
 
+func getRegion(v *Value) nodeRegion {
+	t := v.Type
+	n, ok := v.Aux.(GCNode)
+
+	if v.Op == OpAddr && !isTypeAddr(v) ||
+		t.IsUnsafePtr() ||
+		!t.IsMemory() && ok && n.StorageClass() != ClassAuto && types.Haspointers(t) {
+
+		return outside
+	}
+
+	for hasElem(t) {
+		t = t.Elem()
+	}
+
+	if t.HasHeapPointer() {
+		// v has some pointer to heap so we consider it as being
+		// outside of the curr fn.
+		return outside
+	}
+
+	return inside
+}
+
+func propagRegion(graph map[*Value]*escapeNode) {
 	for _, node := range graph {
 		if node.region == inside {
 			continue
 		}
 
-		wg.Add(1)
-		go func(node *escapeNode) {
-			defer wg.Done()
-			stack := []*escapeNode{}
-			visited := map[*escapeNode]bool{}
+		queue := []*escapeNode{}
+		queue = append(queue, node)
 
-			stack = append(stack, node.references...)
-			parent := node
+		visited := map[*escapeNode]bool{}
+		visited[node] = true
 
-			for len(stack) > 0 {
-				var child *escapeNode
-				child, stack = stack[len(stack)-1], stack[:len(stack)-1]
+		for len(queue) > 0 {
+			var parent *escapeNode
+			parent, queue = queue[0], queue[1:]
 
-				// If child region is outside, let the child propagate its
-				// region.
-				if child.region == outside {
-					break
-				}
-
+			for _, child := range parent.references {
 				if visited[child] {
 					continue
 				}
 
-				if parent.region == outside {
-					child.region = outside
-				}
-
+				child.region = outside
+				queue = append(queue, child)
 				visited[child] = true
-				stack = append(stack, child.references...)
-				parent = child
 			}
-		}(node)
+		}
 	}
-
-	wg.Wait()
 }
 
 func walk(root *escapeNode, graph map[*Value]*escapeNode) {
@@ -286,16 +276,19 @@ func walk(root *escapeNode, graph map[*Value]*escapeNode) {
 }
 
 func visit(node *escapeNode, graph map[*Value]*escapeNode) {
-	// We care only about function calls that somehow uses the root node value.
-	if node.value.Op.IsCall() && !isNewobjCall(node.value) {
+	if node.value.Op.IsCall() {
 		// TODO: there's any way to handle this?
 		node.state = mustEscape
 		return
 	}
 
+	if t := node.value.Type; !(t.IsMemory() || types.Haspointers(t)) {
+		node.state = safe
+		return
+	}
+
 	switch node.value.Op {
 	case OpStore, OpMove:
-		// TODO: there's any other OP with write semantics?
 		src, dst := node.value.Args[1], node.value.Args[0]
 
 		if !types.Haspointers(src.Type) {
@@ -306,36 +299,6 @@ func visit(node *escapeNode, graph map[*Value]*escapeNode) {
 		// Assigning address to a value that is outside of the curr fn.
 		if graph[dst].region == outside {
 			node.state = mustEscape
-			return
 		}
-
-		node.state = checkHeapPointer(src.Type)
-
-	default:
-		t := node.value.Type
-		if !types.Haspointers(t) && !t.IsMemory() {
-			node.state = safe
-			return
-		}
-
-		// TODO: Relax this constraint?
-		node.state = checkHeapPointer(t)
 	}
-}
-
-func checkHeapPointer(t *types.Type) (state nodeState) {
-	state = mayEscape
-
-	for t.IsPtr() {
-		t = t.Elem()
-	}
-
-	if t.HasHeapPointer() {
-		// v has some pointer to heap so we consider it as being
-		// outside of the curr fn.
-		// TODO: Try to relax this constraint a bit.
-		state = mustEscape
-	}
-
-	return
 }
